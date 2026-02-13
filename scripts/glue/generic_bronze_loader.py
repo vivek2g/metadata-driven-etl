@@ -1,3 +1,4 @@
+# Initial Pipeline Trigger - v1.0
 import sys
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
