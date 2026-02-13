@@ -1,0 +1,28 @@
+name: Deploy ETL Scripts
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/glue/**'  # Triggers only when Python scripts change
+
+jobs:
+  deploy-glue-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Deploy Script to S3
+        run: |
+          echo "Deploying ALL scripts..."
+          # This uploads generic_bronze_loader.py AND any future scripts automatically
+          aws s3 sync scripts/glue/ s3://medallion-dev-ops-use1/scripts/
