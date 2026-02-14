@@ -7,6 +7,7 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql import functions as F
 from pyspark.sql.types import *
+import pg8000
 
 # 1. GET PARAMETERS
 # We only need ONE argument: The Table Name. The rest comes from the DB.
@@ -158,6 +159,10 @@ df_transformed.write.mode("append").parquet(bronze_path)
 # 7. UPDATE WATERMARK (The "State")
 # -------------------------------------------------------------------------
 # Find the max date in the batch we just processed
+# -------------------------------------------------------------------------
+# 7. UPDATE WATERMARK (The "State")
+# -------------------------------------------------------------------------
+# Find the max date in the batch we just processed
 if watermark_col:
     # Note: We need to use the TARGET name of the watermark column now
     target_watermark_col = column_mapping[watermark_col]['target']
@@ -168,15 +173,68 @@ if watermark_col:
     if new_watermark:
         print(f"--- Updating Watermark to: {new_watermark} ---")
         
-        # We use a pure JDBC update here.
-        # Since Spark generic JDBC writer is for INSERT, for UPDATE we usually use a custom function
-        # or a quick driver hack. For standard Glue, the cleanest way is often overwriting a 1-row temp table
-        # and running a stored proc, OR just using a raw connection.
+        # 1. Fetch secure connection details from AWS Glue using Boto3
+        import boto3
+        import pg8000
+        import re
         
-        # SIMPLIFIED APPROACH FOR DEMO: 
-        # In Prod, you'd use pg8000 or psycopg2. Here, we print the SQL for you to verify manually first.
-        # Because Spark doesn't support "UPDATE WHERE" natively via JDBC write.
-        
-        print(f"PLEASE EXECUTE DB UPDATE: UPDATE control_plane.bronze_table_details SET last_watermark_value = '{new_watermark}' WHERE table_id = {table_id}")
+        try:
+            # We use the region from the current session
+            session = boto3.session.Session()
+            glue_client = session.client('glue')
+            
+            # Fetch the connection. HidePassword=False is required to retrieve the secret.
+            conn_response = glue_client.get_connection(
+                Name=args['METADATA_CONN_NAME'], 
+                HidePassword=False 
+            )
+            
+            conn_props = conn_response['Connection']['ConnectionProperties']
+            jdbc_url = conn_props['JDBC_CONNECTION_URL']
+            username = conn_props['USERNAME']
+            password = conn_props['PASSWORD']
+            
+            # Parse the JDBC URL (jdbc:postgresql://HOST:PORT/DATABASE)
+            match = re.search(r'jdbc:postgresql://([^:]+):(\d+)/(.+)', jdbc_url)
+            if not match:
+                raise ValueError(f"Could not parse JDBC URL: {jdbc_url}")
+                
+            host, port, database = match.groups()
+            
+            # 2. Connect via pg8000 from the Spark Driver
+            print(f"Connecting to metadata database: {database} at {host}...")
+            pg_conn = pg8000.connect(
+                host=host,
+                database=database,
+                port=int(port),
+                user=username,
+                password=password
+            )
+            
+            cursor = pg_conn.cursor()
+            
+            # 3. Execute the Update safely using parameterized queries (%s)
+            update_query = """
+                UPDATE control_plane.bronze_table_details 
+                SET last_watermark_value = %s 
+                WHERE table_id = %s
+            """
+            
+            # Ensure new_watermark is passed as a string/native type
+            cursor.execute(update_query, (str(new_watermark), table_id))
+            
+            # 4. CRITICAL: Commit the transaction
+            pg_conn.commit()
+            print(f"Successfully updated table_id {table_id} with watermark: {new_watermark}")
+            
+        except Exception as e:
+            print(f"FAILED to update watermark: {str(e)}")
+            if 'pg_conn' in locals():
+                pg_conn.rollback()
+        finally:
+            if 'cursor' in locals():
+                cursor.close()
+            if 'pg_conn' in locals():
+                pg_conn.close()
 
 job.commit()
