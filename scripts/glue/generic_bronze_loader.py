@@ -267,11 +267,18 @@ if watermark_col:
         print(f"--- DEBUG: Prepared to Update Watermark via JVM. Value: '{new_watermark}' ---")
         
         try:
-            # 1. Fetch raw credentials (No parsing needed!)
+            # 1. Fetch raw credentials
             jdbc_conf = glueContext.extract_jdbc_conf(args['METADATA_CONN_NAME'])
             db_url = jdbc_conf['url']
             db_user = jdbc_conf['user']
             db_pass = jdbc_conf['password']
+            
+            # --- THE MISSING PIECE ---
+            # Glue dropped the DB name. We manually append it for the Java driver.
+            db_name = "YOUR_ACTUAL_DB_NAME"  # <-- PUT YOUR REAL DATABASE NAME HERE
+            
+            if db_url.count('/') == 2 or not db_url.endswith(f"/{db_name}"):
+                db_url = f"{db_url.rstrip('/')}/{db_name}"
             
             # 2. Access the underlying Java Virtual Machine (JVM) via Py4J
             DriverManager = sc._gateway.jvm.java.sql.DriverManager
