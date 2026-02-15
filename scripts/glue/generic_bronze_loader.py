@@ -104,6 +104,15 @@ if file_fmt == 'csv':
 
 df_source = spark.read.format(file_fmt).options(**options).load(source_path)
 
+# --- NEW DEBUG & CLEANUP CODE ---
+print(f"--- DEBUG: Raw columns seen by Spark: {df_source.columns} ---")
+
+# Strip invisible BOM characters and leading/trailing spaces from all column names
+cleaned_columns = [c.replace('\ufeff', '').strip() for c in df_source.columns]
+df_source = df_source.toDF(*cleaned_columns)
+
+print(f"--- DEBUG: Cleaned columns: {df_source.columns} ---")
+
 # -------------------------------------------------------------------------
 # 4. APPLY SCHEMA & VALIDATION + FEEDBACK LOOP
 # -------------------------------------------------------------------------
