@@ -31,8 +31,8 @@ print(f"--- Starting Job for Table: {table_name_param} ---")
 
 # A. Get Table Details
 table_query = f"""
-    SELECT table_id, source_s3_path, file_format, delimiter, has_header, 
-           watermark_col_name, last_watermark_value, load_type
+    SELECT table_id, source_s3_path, target_s3_path, file_format, delimiter, has_header, 
+           watermark_col_name, last_watermark_value, load_type, partition_cols
     FROM control_plane.bronze_table_details 
     WHERE table_name = '{table_name_param}' AND is_active = true
 """
@@ -56,6 +56,8 @@ if df_table_config.count() == 0:
 config = df_table_config.collect()[0]
 table_id = config['table_id']
 source_path = config['source_s3_path']
+target_path = config['target_s3_path']
+partition_cols_str = config['partition_cols']
 file_fmt = config['file_format']
 watermark_col = config['watermark_col_name']
 last_watermark = config['last_watermark_value']
@@ -99,17 +101,97 @@ if file_fmt == 'csv':
 df_source = spark.read.format(file_fmt).options(**options).load(source_path)
 
 # -------------------------------------------------------------------------
-# 4. APPLY SCHEMA & VALIDATION
+# 4. APPLY SCHEMA & VALIDATION + FEEDBACK LOOP
 # -------------------------------------------------------------------------
 
-# A. Check for REQUIRED columns
 source_columns = df_source.columns
+
+# A. Check for REQUIRED columns based on the Data Contract 
 for src_col, rules in column_mapping.items():
     if rules['required'] and src_col not in source_columns:
         raise Exception(f"SCHEMA ERROR: Missing required column '{src_col}' in source file.")
 
-# B. Incremental Filter (Watermark)
-# We only filter if we have a valid watermark column and value
+# B. The Schema Drift "Feedback Loop"
+# Find columns that are in the source file, but NOT in our Postgres dictionary
+postgres_known_columns = set(column_mapping.keys())
+actual_source_columns = set(source_columns)
+new_discovered_columns = actual_source_columns - postgres_known_columns
+
+if new_discovered_columns:
+    print(f"--- SCHEMA DRIFT DETECTED! Found new columns: {new_discovered_columns} ---")
+    
+    import boto3
+    import pg8000
+    import re
+    
+    try:
+        # Fetch secure connection details
+        session = boto3.session.Session()
+        glue_client = session.client('glue')
+        conn_response = glue_client.get_connection(Name=args['METADATA_CONN_NAME'], HidePassword=False)
+        conn_props = conn_response['Connection']['ConnectionProperties']
+        
+        match = re.search(r'jdbc:postgresql://([^:]+):(\d+)/(.+)', conn_props['JDBC_CONNECTION_URL'])
+        host, port, database = match.groups()
+        
+        print("Connecting to metadata database to log new columns...")
+        pg_conn = pg8000.connect(
+            host=host, database=database, port=int(port),
+            user=conn_props['USERNAME'], password=conn_props['PASSWORD']
+        )
+        cursor = pg_conn.cursor()
+        
+        # Insert each new column into the control plane
+        insert_query = """
+            INSERT INTO control_plane.bronze_column_details 
+            (table_id, source_col_name, target_col_name, data_type, is_required, is_pii, is_auto_discovered) 
+            VALUES (%s, %s, %s, %s, FALSE, FALSE, TRUE)
+            ON CONFLICT (table_id, source_col_name) 
+            DO UPDATE SET last_seen_date = CURRENT_TIMESTAMP;
+        """
+        
+        # Convert Spark's dtypes list into a dictionary for easy lookup
+        # e.g., {'employee_id': 'int', 'name': 'string'}
+        source_dtypes = dict(df_source.dtypes)
+        
+        for col in new_discovered_columns:
+            # 1. Ask Spark what the actual data type is
+            spark_type = source_dtypes.get(col, 'string') # Default to string if not found
+            
+            # 2. (Optional but recommended) Map Spark types to standard SQL types for Postgres
+            # You can expand this map based on your needs
+            sql_type = 'VARCHAR'
+            if spark_type in ['int', 'bigint', 'smallint']:
+                sql_type = 'INTEGER'
+            elif spark_type in ['double', 'float', 'decimal']:
+                sql_type = 'NUMERIC'
+            elif spark_type == 'boolean':
+                sql_type = 'BOOLEAN'
+            elif spark_type in ['timestamp', 'date']:
+                sql_type = 'TIMESTAMP'
+
+            # 3. Execute the insert using the dynamically mapped SQL type
+            cursor.execute(insert_query, (table_id, col, col, sql_type))
+            
+            # Add the new column to our in-memory mapping so the rest of the script handles it
+            column_mapping[col] = {
+                'target': col,
+                'is_pii': False,
+                'required': False
+            }
+            
+        pg_conn.commit()
+        print(f"Successfully logged {len(new_discovered_columns)} new columns to the control plane.")
+        
+    except Exception as e:
+        print(f"WARNING: Failed to log new columns to metadata: {str(e)}")
+        if 'pg_conn' in locals():
+            pg_conn.rollback()
+    finally:
+        if 'cursor' in locals(): cursor.close()
+        if 'pg_conn' in locals(): pg_conn.close()
+
+# C. Incremental Filter (Watermark CDC)
 if watermark_col and last_watermark and watermark_col in source_columns:
     print(f"--- Filtering data > {last_watermark} ---")
     df_source = df_source.filter(F.col(watermark_col) > last_watermark)
@@ -146,14 +228,23 @@ for src_col in source_columns:
 df_transformed = df_source.select(*select_exprs)
 
 # -------------------------------------------------------------------------
-# 6. WRITE TO BRONZE
+# 6. WRITE TO BRONZE (With Dynamic Partitioning)
 # -------------------------------------------------------------------------
-# Output path: s3://bucket/bronze/{table_name}/
-bronze_path = f"s3://vivek-weather-datalake/bronze/{table_name_param}/"
+print(f"--- Writing Data to {target_path} ---")
 
-print(f"--- Writing Data to {bronze_path} ---")
+writer = df_transformed.write.mode("append")
 
-df_transformed.write.mode("append").parquet(bronze_path)
+if partition_cols_str:
+    # Convert the comma-separated string into a Python list
+    # e.g., "city, department" -> ['city', 'department']
+    partition_list = [col.strip() for col in partition_cols_str.split(',')]
+    print(f"--- Partitioning data by: {partition_list} ---")
+    
+    # Apply the partitions
+    writer = writer.partitionBy(*partition_list)
+
+# Execute the write
+writer.parquet(target_path)
 
 # -------------------------------------------------------------------------
 # 7. UPDATE WATERMARK (The "State")
