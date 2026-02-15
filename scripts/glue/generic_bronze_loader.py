@@ -269,65 +269,36 @@ if watermark_col:
     if new_watermark:
         print(f"--- Updating Watermark to: {new_watermark} ---")
         
-        # 1. Fetch secure connection details from AWS Glue using Boto3
-        
         try:
-            # We use the region from the current session
-            session = boto3.session.Session()
-            glue_client = session.client('glue')
-            
-            # Fetch the connection. HidePassword=False is required to retrieve the secret.
-            conn_response = glue_client.get_connection(
-                Name=args['METADATA_CONN_NAME'], 
-                HidePassword=False 
-            )
-            
-            conn_props = conn_response['Connection']['ConnectionProperties']
-            jdbc_url = conn_props['JDBC_CONNECTION_URL']
-            username = conn_props['USERNAME']
-            password = conn_props['PASSWORD']
-            
-            # Parse the JDBC URL (jdbc:postgresql://HOST:PORT/DATABASE)
-            match = re.search(r'jdbc:postgresql://([^:]+):(\d+)/(.+)', jdbc_url)
-            if not match:
-                raise ValueError(f"Could not parse JDBC URL: {jdbc_url}")
-                
-            host, port, database = match.groups()
-            
-            # 2. Connect via pg8000 from the Spark Driver
-            print(f"Connecting to metadata database: {database} at {host}...")
-            pg_conn = pg8000.connect(
-                host=host,
-                database=database,
-                port=int(port),
-                user=username,
-                password=password
-            )
-            
-            cursor = pg_conn.cursor()
-            
-            # 3. Execute the Update safely using parameterized queries (%s)
-            update_query = """
-                UPDATE control_plane.bronze_table_details 
-                SET last_watermark_value = %s 
-                WHERE table_id = %s
+            # THE JEDI MIND TRICK: Disguise an UPDATE as a SELECT using a CTE
+            # Spark thinks it is reading a dataframe, but Postgres runs the update!
+            update_query = f"""
+                WITH updated AS (
+                    UPDATE control_plane.bronze_table_details 
+                    SET last_watermark_value = '{new_watermark}' 
+                    WHERE table_id = {table_id} 
+                    RETURNING table_id
+                )
+                SELECT * FROM updated
             """
             
-            # Ensure new_watermark is passed as a string/native type
-            cursor.execute(update_query, (str(new_watermark), table_id))
+            # Execute safely through the Glue native JDBC reader (VPC Safe)
+            df_update = glueContext.create_dynamic_frame.from_options(
+                connection_type="postgresql",
+                connection_options={
+                    "useConnectionProperties": "true",
+                    "connectionName": args['METADATA_CONN_NAME'],
+                    "dbtable": "control_plane.bronze_table_details", # Dummy table for Glue parser
+                    "query": update_query
+                }
+            ).toDF()
             
-            # 4. CRITICAL: Commit the transaction
-            pg_conn.commit()
+            # CRITICAL: We must run a Spark Action (.collect) to force the query to execute
+            result = df_update.collect()
+            
             print(f"Successfully updated table_id {table_id} with watermark: {new_watermark}")
             
         except Exception as e:
             print(f"FAILED to update watermark: {str(e)}")
-            if 'pg_conn' in locals():
-                pg_conn.rollback()
-        finally:
-            if 'cursor' in locals():
-                cursor.close()
-            if 'pg_conn' in locals():
-                pg_conn.close()
 
 job.commit()
