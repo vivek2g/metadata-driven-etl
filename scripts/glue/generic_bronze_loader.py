@@ -271,15 +271,75 @@ if watermark_col:
         import pg8000
         import re
         
+        # try:
+        #     # 1. The VPC-Safe native Glue method to get credentials (No Boto3 needed!)
+        #     jdbc_conf = glueContext.extract_jdbc_conf(args['METADATA_CONN_NAME'])
+            
+        #     # jdbc_conf securely contains your 'url', 'user', and 'password'
+        #     match = re.search(r'jdbc:postgresql://([^:]+):(\d+)/(.+)', jdbc_conf['url'])
+        #     host, port, database = match.groups()
+            
+        #     print(f"Connecting to Postgres to explicitly COMMIT the update...")
+        #     pg_conn = pg8000.connect(
+        #         host=host,
+        #         database=database,
+        #         port=int(port),
+        #         user=jdbc_conf['user'],
+        #         password=jdbc_conf['password']
+        #     )
+            
+        #     cursor = pg_conn.cursor()
+            
+        #     # 2. Execute the Update
+        #     update_query = """
+        #         UPDATE control_plane.bronze_table_details 
+        #         SET last_watermark_value = %s 
+        #         WHERE table_id = %s
+        #     """
+            
+        #     cursor.execute(update_query, (str(new_watermark), table_id))
+            
+        #     # 3. THIS IS WHAT WE WERE MISSING! The explicit commit to stop the rollback.
+        #     pg_conn.commit()
+        #     print(f"Successfully updated table_id {table_id} with watermark: {new_watermark}")
+            
+        # except Exception as e:
+        #     print(f"FAILED to update watermark: {str(e)}")
+        #     if 'pg_conn' in locals():
+        #         pg_conn.rollback()
+        # finally:
+        #     if 'cursor' in locals(): cursor.close()
+        #     if 'pg_conn' in locals(): pg_conn.close()
+
         try:
-            # 1. The VPC-Safe native Glue method to get credentials (No Boto3 needed!)
+            # 1. Fetch credentials natively (VPC Safe)
             jdbc_conf = glueContext.extract_jdbc_conf(args['METADATA_CONN_NAME'])
+            raw_url = jdbc_conf['url']
+            print(f"--- DEBUG 1: Raw JDBC URL: {raw_url} ---")
             
-            # jdbc_conf securely contains your 'url', 'user', and 'password'
-            match = re.search(r'jdbc:postgresql://([^:]+):(\d+)/(.+)', jdbc_conf['url'])
-            host, port, database = match.groups()
+            # 2. Bulletproof String Parsing (No Regex)
+            # Remove the prefixes
+            clean_url = raw_url.replace("jdbc:postgresql://", "").replace("jdbc:postgres://", "")
             
-            print(f"Connecting to Postgres to explicitly COMMIT the update...")
+            # Split out the database name from the host/port
+            if "/" in clean_url:
+                host_port, db_and_params = clean_url.split("/", 1)
+                # Remove any trailing query parameters like '?currentSchema=public'
+                database = db_and_params.split("?")[0] 
+            else:
+                host_port = clean_url
+                database = "postgres" # Default fallback
+                
+            # Split host and port safely
+            if ":" in host_port:
+                host, port = host_port.split(":", 1)
+            else:
+                host = host_port
+                port = "5432" # Default Postgres port if missing from URL
+                
+            print(f"--- DEBUG 2: Parsed Host: {host} | Port: {port} | DB: {database} ---")
+            
+            # 3. Connect to Postgres
             pg_conn = pg8000.connect(
                 host=host,
                 database=database,
@@ -290,21 +350,28 @@ if watermark_col:
             
             cursor = pg_conn.cursor()
             
-            # 2. Execute the Update
+            # 4. Execute the Update
             update_query = """
                 UPDATE control_plane.bronze_table_details 
                 SET last_watermark_value = %s 
                 WHERE table_id = %s
             """
             
-            cursor.execute(update_query, (str(new_watermark), table_id))
+            # Explicitly cast table_id to int to ensure exact matching
+            cursor.execute(update_query, (str(new_watermark), int(table_id)))
             
-            # 3. THIS IS WHAT WE WERE MISSING! The explicit commit to stop the rollback.
+            rows_affected = cursor.rowcount
+            print(f"--- DEBUG 3: Rows affected by UPDATE: {rows_affected} ---")
+            
+            if rows_affected == 0:
+                print(f"--- WARNING: No rows updated! Ensure table_id {table_id} exists. ---")
+            
+            # 5. COMMIT (The most important step!)
             pg_conn.commit()
-            print(f"Successfully updated table_id {table_id} with watermark: {new_watermark}")
+            print(f"--- DEBUG 4: Explicit COMMIT executed successfully ---")
             
         except Exception as e:
-            print(f"FAILED to update watermark: {str(e)}")
+            print(f"--- FAILED to update watermark: {str(e)} ---")
             if 'pg_conn' in locals():
                 pg_conn.rollback()
         finally:
