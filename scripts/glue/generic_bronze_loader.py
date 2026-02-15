@@ -256,126 +256,50 @@ if partition_cols_str:
 writer.parquet(target_path)
 
 # -------------------------------------------------------------------------
-# 7. UPDATE WATERMARK (The "State")
+# 7. UPDATE WATERMARK (The "State") - JVM BRIDGING VERSION
 # -------------------------------------------------------------------------
 if watermark_col:
-    # Note: We need to use the TARGET name of the watermark column now
     target_watermark_col = column_mapping[watermark_col]['target']
-    
     max_date_row = df_transformed.agg(F.max(target_watermark_col).alias("max_val")).collect()[0]
     new_watermark = max_date_row["max_val"]
     
     if new_watermark:
-        print(f"--- Updating Watermark to: {new_watermark} ---")
+        print(f"--- DEBUG: Prepared to Update Watermark via JVM. Value: '{new_watermark}' ---")
         
-        import pg8000
-        import re
-        
-        # try:
-        #     # 1. The VPC-Safe native Glue method to get credentials (No Boto3 needed!)
-        #     jdbc_conf = glueContext.extract_jdbc_conf(args['METADATA_CONN_NAME'])
-            
-        #     # jdbc_conf securely contains your 'url', 'user', and 'password'
-        #     match = re.search(r'jdbc:postgresql://([^:]+):(\d+)/(.+)', jdbc_conf['url'])
-        #     host, port, database = match.groups()
-            
-        #     print(f"Connecting to Postgres to explicitly COMMIT the update...")
-        #     pg_conn = pg8000.connect(
-        #         host=host,
-        #         database=database,
-        #         port=int(port),
-        #         user=jdbc_conf['user'],
-        #         password=jdbc_conf['password']
-        #     )
-            
-        #     cursor = pg_conn.cursor()
-            
-        #     # 2. Execute the Update
-        #     update_query = """
-        #         UPDATE control_plane.bronze_table_details 
-        #         SET last_watermark_value = %s 
-        #         WHERE table_id = %s
-        #     """
-            
-        #     cursor.execute(update_query, (str(new_watermark), table_id))
-            
-        #     # 3. THIS IS WHAT WE WERE MISSING! The explicit commit to stop the rollback.
-        #     pg_conn.commit()
-        #     print(f"Successfully updated table_id {table_id} with watermark: {new_watermark}")
-            
-        # except Exception as e:
-        #     print(f"FAILED to update watermark: {str(e)}")
-        #     if 'pg_conn' in locals():
-        #         pg_conn.rollback()
-        # finally:
-        #     if 'cursor' in locals(): cursor.close()
-        #     if 'pg_conn' in locals(): pg_conn.close()
-
         try:
-            # 1. Fetch credentials natively (VPC Safe)
+            # 1. Fetch raw credentials (No parsing needed!)
             jdbc_conf = glueContext.extract_jdbc_conf(args['METADATA_CONN_NAME'])
-            raw_url = jdbc_conf['url']
-            print(f"--- DEBUG 1: Raw JDBC URL: {raw_url} ---")
+            db_url = jdbc_conf['url']
+            db_user = jdbc_conf['user']
+            db_pass = jdbc_conf['password']
             
-            # 2. Bulletproof String Parsing (No Regex)
-            # Remove the prefixes
-            clean_url = raw_url.replace("jdbc:postgresql://", "").replace("jdbc:postgres://", "")
+            # 2. Access the underlying Java Virtual Machine (JVM) via Py4J
+            DriverManager = sc._gateway.jvm.java.sql.DriverManager
             
-            # Split out the database name from the host/port
-            if "/" in clean_url:
-                host_port, db_and_params = clean_url.split("/", 1)
-                # Remove any trailing query parameters like '?currentSchema=public'
-                database = db_and_params.split("?")[0] 
-            else:
-                host_port = clean_url
-                database = "postgres" # Default fallback
+            # 3. Open connection natively using Spark's own JDBC driver
+            print(f"--- DEBUG: Connecting natively to JVM URL: {db_url} ---")
+            conn = DriverManager.getConnection(db_url, db_user, db_pass)
+            
+            # 4. Execute the update
+            stmt = conn.createStatement()
+            update_query = f"UPDATE control_plane.bronze_table_details SET last_watermark_value = '{new_watermark}' WHERE table_id = {table_id}"
+            
+            rows_affected = stmt.executeUpdate(update_query)
+            print(f"--- DEBUG: Rows affected by JVM UPDATE: {rows_affected} ---")
+            
+            # 5. Force COMMIT
+            if not conn.getAutoCommit():
+                conn.commit()
                 
-            # Split host and port safely
-            if ":" in host_port:
-                host, port = host_port.split(":", 1)
-            else:
-                host = host_port
-                port = "5432" # Default Postgres port if missing from URL
-                
-            print(f"--- DEBUG 2: Parsed Host: {host} | Port: {port} | DB: {database} ---")
-            
-            # 3. Connect to Postgres
-            pg_conn = pg8000.connect(
-                host=host,
-                database=database,
-                port=int(port),
-                user=jdbc_conf['user'],
-                password=jdbc_conf['password']
-            )
-            
-            cursor = pg_conn.cursor()
-            
-            # 4. Execute the Update
-            update_query = """
-                UPDATE control_plane.bronze_table_details 
-                SET last_watermark_value = %s 
-                WHERE table_id = %s
-            """
-            
-            # Explicitly cast table_id to int to ensure exact matching
-            cursor.execute(update_query, (str(new_watermark), int(table_id)))
-            
-            rows_affected = cursor.rowcount
-            print(f"--- DEBUG 3: Rows affected by UPDATE: {rows_affected} ---")
-            
-            if rows_affected == 0:
-                print(f"--- WARNING: No rows updated! Ensure table_id {table_id} exists. ---")
-            
-            # 5. COMMIT (The most important step!)
-            pg_conn.commit()
-            print(f"--- DEBUG 4: Explicit COMMIT executed successfully ---")
+            print(f"--- DEBUG: JVM Explicit COMMIT executed successfully! ---")
             
         except Exception as e:
-            print(f"--- FAILED to update watermark: {str(e)} ---")
-            if 'pg_conn' in locals():
-                pg_conn.rollback()
+            print(f"--- FAILED to update watermark via JVM: {str(e)} ---")
+            
         finally:
-            if 'cursor' in locals(): cursor.close()
-            if 'pg_conn' in locals(): pg_conn.close()
+            # Cleanly close Java resources
+            if 'stmt' in locals() and stmt is not None: stmt.close()
+            if 'conn' in locals() and conn is not None: conn.close()
 
+# Tell AWS Glue the job is officially done
 job.commit()
