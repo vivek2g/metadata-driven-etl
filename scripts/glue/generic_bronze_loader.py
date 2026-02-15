@@ -46,8 +46,9 @@ df_table_config = glueContext.create_dynamic_frame.from_options(
     connection_type="postgresql",
     connection_options={
         "useConnectionProperties": "true",
-        "query": table_query,
-        "connectionName": db_connection_name
+        "connectionName": db_connection_name,
+        "dbtable": "control_plane.bronze_table_details",  # <-- The Dummy key to keep Glue working, we will override it with "query"
+        "query": table_query                              # <-- The actual query Postgres will run
     }
 ).toDF()
 
@@ -77,8 +78,9 @@ df_col_config = glueContext.create_dynamic_frame.from_options(
     connection_type="postgresql",
     connection_options={
         "useConnectionProperties": "true",
-        "query": col_query,
-        "connectionName": db_connection_name
+        "connectionName": db_connection_name,
+        "dbtable": "control_plane.bronze_column_details", # <-- The Dummy key to keep Glue working, we will override it with "query"
+        "query": col_query                                # <-- The actual query Postgres will run
     }
 ).toDF().collect()
 
