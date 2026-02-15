@@ -275,7 +275,7 @@ if watermark_col:
             
             # --- THE MISSING PIECE ---
             # Glue dropped the DB name. We manually append it for the Java driver.
-            db_name = "YOUR_ACTUAL_DB_NAME"  # <-- PUT YOUR REAL DATABASE NAME HERE
+            db_name = "etl_framework" 
             
             if db_url.count('/') == 2 or not db_url.endswith(f"/{db_name}"):
                 db_url = f"{db_url.rstrip('/')}/{db_name}"
