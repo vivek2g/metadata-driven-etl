@@ -8,6 +8,8 @@ from awsglue.job import Job
 from pyspark.sql import functions as F
 from pyspark.sql.types import *
 import pg8000
+import boto3
+import re
 
 # 1. GET PARAMETERS
 # We only need ONE argument: The Table Name. The rest comes from the DB.
@@ -44,7 +46,7 @@ df_table_config = glueContext.create_dynamic_frame.from_options(
     connection_type="postgresql",
     connection_options={
         "useConnectionProperties": "true",
-        "dbtable": f"({table_query}) as t",
+        "query": table_query,
         "connectionName": db_connection_name
     }
 ).toDF()
@@ -75,7 +77,7 @@ df_col_config = glueContext.create_dynamic_frame.from_options(
     connection_type="postgresql",
     connection_options={
         "useConnectionProperties": "true",
-        "dbtable": f"({col_query}) as c",
+        "query": col_query,
         "connectionName": db_connection_name
     }
 ).toDF().collect()
@@ -119,10 +121,6 @@ new_discovered_columns = actual_source_columns - postgres_known_columns
 
 if new_discovered_columns:
     print(f"--- SCHEMA DRIFT DETECTED! Found new columns: {new_discovered_columns} ---")
-    
-    import boto3
-    import pg8000
-    import re
     
     try:
         # Fetch secure connection details
@@ -250,10 +248,6 @@ writer.parquet(target_path)
 # 7. UPDATE WATERMARK (The "State")
 # -------------------------------------------------------------------------
 # Find the max date in the batch we just processed
-# -------------------------------------------------------------------------
-# 7. UPDATE WATERMARK (The "State")
-# -------------------------------------------------------------------------
-# Find the max date in the batch we just processed
 if watermark_col:
     # Note: We need to use the TARGET name of the watermark column now
     target_watermark_col = column_mapping[watermark_col]['target']
@@ -265,9 +259,6 @@ if watermark_col:
         print(f"--- Updating Watermark to: {new_watermark} ---")
         
         # 1. Fetch secure connection details from AWS Glue using Boto3
-        import boto3
-        import pg8000
-        import re
         
         try:
             # We use the region from the current session
