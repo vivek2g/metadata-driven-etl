@@ -9,10 +9,10 @@ def get_db_connection():
         # We use simple local credentials for testing. 
         # In AWS Glue, this would pull from Secrets Manager.
         conn = psycopg2.connect(
-            host="control-plane.c0xcmc2qiesm.us-east-1.rds.amazonaws.com",
-            database="etl_framework",
-            user="postgres",
-            password="glamf103", #need to be hardcoded for testing, but should be stored securely in production using secret manager
+            host=os.getenv("DB_HOST"),
+            database=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
             port="5432"
         )
         return conn
