@@ -1,4 +1,4 @@
-name: Deploy Pipeline Scripts to S3
+name: Deploy Bronze Ingestion Framework Scripts to S3
 
 # This triggers the workflow only when you push to the 'main' branch
 # and only if files inside the 'scripts/' folder are changed.
@@ -7,7 +7,7 @@ on:
     branches:
       - main
     paths:
-      - 'scripts/**'
+      - 'bronze_ingestion_framework/**'
 
 jobs:
   deploy:
@@ -24,8 +24,16 @@ jobs:
         # Standard region for India, change if your S3 bucket is elsewhere
         aws-region: us-east-1 
 
-    - name: Sync scripts to S3
-      # The --delete flag ensures that if you delete a script in GitHub, 
-      # it also gets deleted in S3, keeping them perfectly synced.
+    - name: Package Modular Dependencies
       run: |
-        aws s3 sync ./scripts s3://medallion-dev-ops-use1/scripts/ --delete
+        echo "Zipping the modular folders for AWS Glue worker nodes..."
+        # Navigate into your specific project folder
+        cd bronze_ingestion_framework
+        
+        # Zip only the module directories into dependencies.zip
+        zip -r dependencies.zip config/ readers/ processors/ writers/
+
+    - name: Sync scripts to S3
+      run: |
+        # Sync the local framework folder directly to your S3 scripts path
+        aws s3 sync ./bronze_ingestion_framework s3://medallion-dev-ops-use1/scripts/ --delete
